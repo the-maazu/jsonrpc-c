@@ -1,15 +1,24 @@
-/*
- * jsonrpc-c.h
- *
- *  Created on: Oct 11, 2012
- *      Author: hmng
- */
-
 #ifndef JSONRPCC_H_
 #define JSONRPCC_H_
 
 #include "cJSON.h"
-#include <ev.h>
+#include "cy_secure_sockets.h"
+
+/* RPC server related macros. */
+#ifndef JRPC_SERVER_PORT
+#define JRPC_SERVER_PORT                           (1024)
+#endif
+#define JRPC_SERVER_MAX_PENDING_CONNECTIONS        (3)
+#define JRPC_SERVER_RECV_TIMEOUT_MS                (500)
+
+/* RTOS related macros for JRPC server task. */
+#define JRPC_SERVER_TASK_STACK_SIZE                (8 * 1024)
+#define JRPC_SERVER_TASK_PRIORITY                  (1)
+
+/* Buffer size to store the incoming messages from server, in bytes. */
+#define JRPC_MAX_RECV_BUFFER_SIZE                  (1461) // +1 null termination
+
+#define JRPC_LOG(result) log(result)
 
 /*
  *
@@ -46,37 +55,34 @@ struct jrpc_procedure {
 };
 
 struct jrpc_server {
-	int port_number;
-	struct ev_loop *loop;
-	ev_io listen_watcher;
+	cy_socket_t socket;
+	cy_socket_sockaddr_t addr;
 	int procedure_count;
 	struct jrpc_procedure *procedures;
 	int debug_level;
 };
 
 struct jrpc_connection {
-	struct ev_io io;
-	int fd;
+	struct jrpc_server * server;
+	cy_socket_t socket;
+	cy_socket_sockaddr_t peer_addr;
+	uint32_t peer_addr_len;
 	int pos;
 	unsigned int buffer_size;
 	char * buffer;
-	int debug_level;
 };
 
-int jrpc_server_init(struct jrpc_server *server, int port_number);
+void jrpc_server_start(struct jrpc_server *server);
 
-int jrpc_server_init_with_ev_loop(struct jrpc_server *server,
-        int port_number, struct ev_loop *loop);
+void jrpc_server_stop(struct jrpc_server *server);
 
-void jrpc_server_run(struct jrpc_server *server);
-
-int jrpc_server_stop(struct jrpc_server *server);
-
-void jrpc_server_destroy(struct jrpc_server *server);
-
-int jrpc_register_procedure(struct jrpc_server *server,
-		jrpc_function function_pointer, char *name, void *data);
+int jrpc_register_procedure(
+	struct jrpc_server *server, 
+	jrpc_function function_pointer, 
+	char *name, void *data
+);
 
 int jrpc_deregister_procedure(struct jrpc_server *server, char *name);
+void cy_rslt_log(cy_rslt_t result);
 
 #endif
