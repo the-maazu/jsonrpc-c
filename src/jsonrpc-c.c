@@ -3,9 +3,6 @@
 #include <errno.h>
 #include <string.h>
 
-#include "cy_wcm.h"
-
-#include "config.h"
 #ifdef HAVE_STDBOOL_H
 # include <stdbool.h>
 #else
@@ -15,21 +12,34 @@
 # define __bool_true_false_are_defined 1
 #endif
 
+#include "cy_wcm.h"
 #include "jsonrpc-c.h"
 
-// should be globaly initialized in application source after connecting wifi
-extern cy_wcm_ip_address_t wifi_addr;
+#ifndef NDEBUG
+#define JRPC_LOG(...) printf("jrpc: "); printf(__VA_ARGS__); printf("\n");
+#else
+#define JRPC_LOG(...)
+#endif
 
-static void jrpc_procedure_destroy(struct jrpc_procedure *procedure);
-inline void cy_rslt_log(cy_rslt_t result);
+struct jrpc_connection {
+	struct jrpc_server * server;
+	cy_socket_t socket;
+	cy_socket_sockaddr_t peer_addr;
+	uint32_t peer_addr_len;
+	int pos;
+	unsigned int buffer_size;
+	char * buffer;
+};
+
+void jrpc_rslt_log(cy_rslt_t result);
 
 static int send_response(struct jrpc_connection * conn, char *response) {
 	cy_rslt_t result;
-	if (conn->server->debug_level > 1)
-		printf("jrpc: JSON response:\n%s\n", response);
+	JRPC_LOG("JSON response:\n%s", response);
 	result = cy_socket_send(conn->socket, response, strlen(response), CY_SOCKET_FLAGS_MORE, NULL);
-	cy_socket_send(conn->socket, "\n", 1, CY_SOCKET_FLAGS_NONE, NULL);
-	return 0;
+	if(result != CY_RSLT_SUCCESS)
+		return result;
+	return cy_socket_send(conn->socket, "\n", 1, CY_SOCKET_FLAGS_NONE, NULL);
 }
 
 static int send_error(struct jrpc_connection * conn, int code, char* message,
@@ -116,8 +126,7 @@ static int eval_request(struct jrpc_server *server,
 							(id->type == cJSON_String) ? cJSON_CreateString(
 									id->valuestring) :
 									cJSON_CreateNumber(id->valueint);
-				if (server->debug_level)
-					printf("Method Invoked: %s\n", method->valuestring);
+				JRPC_LOG("Method Invoked: %s", method->valuestring);
 				return invoke_procedure(server, conn, method->valuestring,
 						params, id_copy);
 			}
@@ -147,10 +156,13 @@ static cy_rslt_t destroy_connection(cy_socket_t handle, void *arg) {
 	struct jrpc_server *server = (struct jrpc_server *) conn->server;
 	uint32_t bytes_read = 0;
 
+	cJSON *root;
+	const char *end_ptr = NULL;
+
 	if (conn->pos == (conn->buffer_size - 1)) {
 		char * new_buffer = (char *) realloc(conn->buffer, conn->buffer_size *= 2);
 		if (new_buffer == NULL) {
-			printf("jrpc: memory error");
+			JRPC_LOG("memory error");
 			return cy_socket_disconnect(hanlde, 0);
 		}
 		conn->buffer = new_buffer;
@@ -163,50 +175,38 @@ static cy_rslt_t destroy_connection(cy_socket_t handle, void *arg) {
 		max_read_size, CY_SOCKET_FLAGS_NONE, &bytes_read
 	);
 	if (result != CY_RSLT_SUCCESS) {
-		JRPC_LOG(result);
+		jrpc_rslt_log(result);
 		return cy_socket_disconnect(hanlde, 0);
 	}
-	if (!bytes_read) {
-		// client closed the sending half of the connection
-		if (server->debug_level) printf("jrpc: client closed connection.\n");
-		return cy_socket_disconnect(hanlde, 0);
+	conn->pos += bytes_read;
+
+	if ((root = cJSON_ParseWithOpts(conn->buffer, &end_ptr, false)) != NULL) {
+		char * str_result = cJSON_Print(root);
+		JRPC_LOG("Valid JSON Received:\n%s", str_result);
+		free(str_result);
+
+		if (root->type == cJSON_Object) {
+			eval_request(server, conn, root);
+		}
+		//shift processed request, discarding it
+		memmove(conn->buffer, end_ptr, strlen(end_ptr) + 2);
+
+		conn->pos = strlen(end_ptr);
+		memset(conn->buffer + conn->pos, 0,
+				conn->buffer_size - conn->pos - 1);
+
+		cJSON_Delete(root);
 	} else {
-		cJSON *root;
-		const char *end_ptr = NULL;
-		conn->pos += bytes_read;
-
-		if ((root = cJSON_ParseWithOpts(conn->buffer, &end_ptr, false)) != NULL) {
-			if (server->debug_level > 1) {
-				char * str_result = cJSON_Print(root);
-				printf("Valid JSON Received:\n%s\n", str_result);
-				free(str_result);
-			}
-
-			if (root->type == cJSON_Object) {
-				eval_request(server, conn, root);
-			}
-			//shift processed request, discarding it
-			memmove(conn->buffer, end_ptr, strlen(end_ptr) + 2);
-
-			conn->pos = strlen(end_ptr);
-			memset(conn->buffer + conn->pos, 0,
-					conn->buffer_size - conn->pos - 1);
-
-			cJSON_Delete(root);
-		} else {
-			// did we parse the entire buffer? If so, just wait for more.
-			// else there was an error before the buffer's end
-			if (end_ptr != (conn->buffer + conn->pos)) {
-				if (server->debug_level) {
-					printf("INVALID JSON Received:\n---\n%s\n---\n",
-							conn->buffer);
-				}
-				send_error(conn, JRPC_PARSE_ERROR, "Parse error. Invalid JSON was received by the server.", NULL);
-				return cy_socket_disconnect(hanlde, 0);
-			}
+		// did we parse the entire buffer? If so, just wait for more.
+		// else there was an error before the buffer's end
+		if (end_ptr != (conn->buffer + conn->pos)) {
+			JRPC_LOG("INVALID JSON Received:\n---\n%s\n---", conn->buffer);
+			send_error(conn, JRPC_PARSE_ERROR, "Parse error. Invalid JSON was received by the server.", NULL);
+			return cy_socket_disconnect(hanlde, 0);
 		}
 	}
-
+	
+	return result;
 }
 
 cy_rslt_t accept_cb(cy_socket_t handle, void *arg) {
@@ -225,11 +225,16 @@ cy_rslt_t accept_cb(cy_socket_t handle, void *arg) {
 
 	result = cy_socket_accept(server->socket, &conn->peer_addr, &conn->peer_addr_len, &conn->socket);
 	if(result != CY_RSLT_SUCCESS) {
-		JRPC_LOG(result);
+		jrpc_rslt_log(result);
 		free(conn);
 	} else {
-		if (server->debug_level) //TODO: print peer address
-			printf("jrpc: got connection from  %d.%d.%d.%d\n", &conn->peer_addr.ip_address.ip.v4);
+		JRPC_LOG(
+			"got connection from  %d.%d.%d.%d\n",
+			(uint8) (conn->peer_addr.ip_address.ip.v4), 
+			(uint8) (conn->peer_addr.ip_address.ip.v4 >> 8),
+			(uint8) (conn->peer_addr.ip_address.ip.v4 >> 16),
+			(uint8) (conn->peer_addr.ip_address.ip.v4 >> 24)
+		);
 		
 		conn->server = server;
 		conn->buffer_size = JRPC_MAX_RECV_BUFFER_SIZE;
@@ -245,76 +250,103 @@ cy_rslt_t accept_cb(cy_socket_t handle, void *arg) {
 
 		if(result != CY_RSLT_SUCCESS)
 		{
-			cy_rslt_log(result);
+			jrpc_rslt_log(result);
 			CY_ASSERT(0);
 		}
 
 		result = cy_socket_setsockopt(
-			conn->socket, CY_SOCKET_SOL_TCP,
+			conn->socket, CY_SOCKET_SOL_SOCKET,
 			CY_SOCKET_SO_RECEIVE_CALLBACK,
 			&recieve_cb,
 			sizeof(cy_socket_opt_callback_t)
 		);
+
+		if(result != CY_RSLT_SUCCESS)
+		{
+			jrpc_rslt_log(result);
+			CY_ASSERT(0);
+		}
 	}
 	return result;
 }
 
-static cy_rslt_t _create_server_socket(struct jrpc_server * server)
+static cy_rslt_t create_tcp_server_socket(struct jrpc_server * server)
 {
     cy_rslt_t result;
 
-    result = cy_socket_create(CY_SOCKET_DOMAIN_AF_INET, CY_SOCKET_TYPE_DGRAM, CY_SOCKET_IPPROTO_TCP, &server->socket);
+    result = cy_socket_create(CY_SOCKET_DOMAIN_AF_INET, CY_SOCKET_TYPE_STREAM, CY_SOCKET_IPPROTO_TCP, &server->socket);
     if (result != CY_RSLT_SUCCESS)
-        return result;
+	{
+		jrpc_rslt_log(result);
+		JRPC_LOG("failed to create socket");
+		CY_ASSERT(0);
+		return result;
+	}
 
-    server->addr.ip_address.ip.v4 = wifi_addr.ip.v4;
-    server->addr.ip_address.version = CY_SOCKET_IP_VER_V4;
     server->addr.port = JRPC_SERVER_PORT;
-    result = cy_socket_bind( &server->socket, &server->addr, sizeof(server->addr));
+    result = cy_socket_bind( server->socket, &server->addr, sizeof(server->addr));
     if (result == CY_RSLT_SUCCESS)
-         printf("Socket bound to port: %d\n", server->addr.port);
+		JRPC_LOG("socket bound to port: %d", server->addr.port);
 
     return result;
 }
 
 void jrpc_server_start(struct jrpc_server * server)
 {
-	server = (struct jrpc_server *) malloc(sizeof (struct jrpc_server));
 	cy_rslt_t result;
+	uint32_t rcv_timeout = JRPC_SERVER_RECV_TIMEOUT_MS;
 	cy_socket_opt_callback_t conn_req_cb = {
 		.callback = accept_cb,
 		.arg = server
 	};
 	
-    result = _create_server_socket(server);
+    result = create_tcp_server_socket(server);
     if (result != CY_RSLT_SUCCESS)
-    {
-        printf("TCP Server Socket creation failed. Error: %"PRIu32"\n", result);
-        CY_ASSERT(0);
-    }
+		return;
 
 	result = cy_socket_setsockopt(
-		server->socket, CY_SOCKET_SOL_TCP, 
+		server->socket, CY_SOCKET_SOL_SOCKET, 
+		CY_SOCKET_SO_RCVTIMEO,
+		&rcv_timeout,
+		sizeof(uint32_t)
+	);
+	if(result != CY_RSLT_SUCCESS)
+		jrpc_rslt_log(result);
+		
+
+	result = cy_socket_setsockopt(
+		server->socket, CY_SOCKET_SOL_SOCKET, 
 		CY_SOCKET_SO_CONNECT_REQUEST_CALLBACK,
 		&conn_req_cb,
 		sizeof(cy_socket_opt_callback_t)
 	);
-
-	memset(server, 0, sizeof(struct jrpc_server));
-	if (server->debug_level != NULL)
-		server->debug_level = 0;
-	else {
-		server->debug_level = strtol( (const char *) &server->debug_level, NULL, 10);
-		printf("jrpc: debug level %d\n", server->debug_level);
-	}
-
-	result = cy_socket_listen(server->socket, 1);
-	if (result != CY_RSLT_SUCCESS) {
-		JRPC_LOG(result);
+	if(result != CY_RSLT_SUCCESS)
+	{
+		jrpc_rslt_log(result);
+		jrpc_server_stop(server);
 		CY_ASSERT(0);
+		return;
 	}
-	if (server->debug_level)
-		printf("jrpc: waiting for connections...\n");
+
+	result = cy_socket_listen(server->socket, JRPC_SERVER_MAX_PENDING_CONNECTIONS);
+	if (result != CY_RSLT_SUCCESS) {
+		jrpc_rslt_log(result);
+		jrpc_server_stop(server);
+		CY_ASSERT(0);
+		return;
+	}
+	JRPC_LOG("waiting for connections...");
+}
+
+void jrpc_procedure_destroy(struct jrpc_procedure *procedure){
+	if (procedure->name){
+		free(procedure->name);
+		procedure->name = NULL;
+	}
+	if (procedure->data){
+		free(procedure->data);
+		procedure->data = NULL;
+	}
 }
 
 void jrpc_server_stop(struct jrpc_server *server){
@@ -324,17 +356,6 @@ void jrpc_server_stop(struct jrpc_server *server){
 	free(server->procedures);
 	cy_socket_delete(server->socket);
 	free(server);
-}
-
-static void jrpc_procedure_destroy(struct jrpc_procedure *procedure){
-	if (procedure->name){
-		free(procedure->name);
-		procedure->name = NULL;
-	}
-	if (procedure->data){
-		free(procedure->data);
-		procedure->data = NULL;
-	}
 }
 
 int jrpc_register_procedure(struct jrpc_server *server,
@@ -387,45 +408,68 @@ int jrpc_deregister_procedure(struct jrpc_server *server, char *name) {
 			}
 		}
 	} else {
-		printf("jrpc : procedure '%s' not found\n", name);
+		JRPC_LOG("procedure '%s' not found", name);
 		return -1;
 	}
 	return 0;
 }
 
-
-void cy_rslt_log(cy_rslt_t result)
+#ifndef NDEBUG
+void jrpc_rslt_log(cy_rslt_t result)
 {
+
     switch(result)
     {
         case CY_RSLT_MODULE_SECURE_SOCKETS_INVALID_SOCKET:
-            printf("jrpc: invalid socket");
+            JRPC_LOG("invalid socket");
             break;
         case CY_RSLT_MODULE_SECURE_SOCKETS_TLS_ERROR:
-            printf("jrpc: tls error");
+			JRPC_LOG("tls error");
             break;
         case CY_RSLT_MODULE_SECURE_SOCKETS_TIMEOUT:
-            printf("jrpc: socket timeout");
+			JRPC_LOG("socket timeout");
             break;
         case CY_RSLT_MODULE_SECURE_SOCKETS_NOMEM:
-            printf("jrpc: nomem");
+			JRPC_LOG("nomem");
             break;
         case CY_RSLT_MODULE_SECURE_SOCKETS_BADARG:
-            printf("jrpc: nomem");
+			JRPC_LOG("badarg");
             break;
         case CY_RSLT_MODULE_SECURE_SOCKETS_NOT_LISTENING:
-            printf("jrpc: nomem");
+			JRPC_LOG("not listening");
             break;           
         case CY_RSLT_MODULE_SECURE_SOCKETS_TCPIP_ERROR:
-            printf("jrpc: tcpip error");
+            JRPC_LOG("tcpip error");
 			break;
 		case CY_RSLT_MODULE_SECURE_SOCKETS_CLOSED:
-			printf("jrpc: secure socket closed");
+			JRPC_LOG("secure socket closed");
 			break;
 		case CY_RSLT_MODULE_SECURE_SOCKETS_WOULDBLOCK:
-			printf("jrpc: secure socket would block");
+			JRPC_LOG("secure socket would block");
+			break;
+		case CY_RSLT_MODULE_SECURE_SOCKETS_ALREADY_CONNECTED:
+			JRPC_LOG("already connected");
+			break;
+		case CY_RSLT_MODULE_SECURE_SOCKETS_INVALID_OPTION:
+			JRPC_LOG("invalid optio");
+			break;
+		case CY_RSLT_MODULE_SECURE_SOCKETS_ADDRESS_IN_USE:
+			JRPC_LOG("address in use");
+			break;
+		case CY_RSLT_MODULE_SECURE_SOCKETS_MAX_MEMBERSHIP_ERROR:
+			JRPC_LOG("max memebership error");
+			break;
+		case CY_RSLT_MODULE_SECURE_SOCKETS_MULTICAST_ADDRESS_NOT_REGISTERED:
+			JRPC_LOG("address not registered");
+			break;
+		case CY_RSLT_MODULE_SECURE_SOCKETS_OPTION_NOT_SUPPORTED:
+			JRPC_LOG("option not supported");
 			break;
         default:
-            printf("jrpc: unknown error");
+            JRPC_LOG("unknown error %d", (int) result);
     }
+
 }
+#elif
+inline void jrpc_rslt_log(void){}
+#endif
