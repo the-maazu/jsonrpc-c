@@ -1,10 +1,10 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <errno.h>
-#include <string.h>
+#include "stdio.h"
+#include "stdlib.h"
+#include "errno.h"
+#include "string.h"
 
 #ifdef HAVE_STDBOOL_H
-# include <stdbool.h>
+# include "stdbool.h"
 #else
 # define bool _Bool
 # define false 0
@@ -13,6 +13,8 @@
 #endif
 
 #include "cy_wcm.h"
+#include "cy_secure_sockets.h"
+
 #include "jsonrpc-c.h"
 
 #ifndef NDEBUG
@@ -27,8 +29,7 @@ struct jrpc_connection {
 	cy_socket_sockaddr_t peer_addr;
 	uint32_t peer_addr_len;
 	int pos;
-	unsigned int buffer_size;
-	char * buffer;
+	char buffer[JRPC_MAX_RECV_BUFFER_SIZE];
 };
 
 void jrpc_rslt_log(cy_rslt_t result);
@@ -55,7 +56,6 @@ static int send_error(struct jrpc_connection * conn, int code, char* message,
 	return_value = send_response(conn, str_result);
 	free(str_result);
 	cJSON_Delete(result_root);
-	free(message);
 	return return_value;
 }
 
@@ -143,14 +143,13 @@ static cy_rslt_t destroy_connection(cy_socket_t handle, void *arg) {
 	result =  cy_socket_delete(handle);
 	if(result == CY_RSLT_SUCCESS)
 	{
-		free(conn->buffer);
 		free(conn);
 	}
 	return result;
 }
 
- static cy_rslt_t recieve( cy_socket_t hanlde, void *arg) 
- {
+static cy_rslt_t recieve( cy_socket_t hanlde, void *arg) 
+{
 	cy_rslt_t result;
 	struct jrpc_connection * conn = (struct jrpc_connection *) arg;
 	struct jrpc_server *server = (struct jrpc_server *) conn->server;
@@ -159,17 +158,13 @@ static cy_rslt_t destroy_connection(cy_socket_t handle, void *arg) {
 	cJSON *root;
 	const char *end_ptr = NULL;
 
-	if (conn->pos == (conn->buffer_size - 1)) {
-		char * new_buffer = (char *) realloc(conn->buffer, conn->buffer_size *= 2);
-		if (new_buffer == NULL) {
-			JRPC_LOG("memory error");
-			return cy_socket_disconnect(hanlde, 0);
-		}
-		conn->buffer = new_buffer;
-		memset(conn->buffer + conn->pos, 0, conn->buffer_size - conn->pos);
+	if (conn->pos == (JRPC_MAX_RECV_BUFFER_SIZE - 1)) {
+		JRPC_LOG("json string too long")
+		conn->pos = 0;
+		memset(conn->buffer, '\0', JRPC_MAX_RECV_BUFFER_SIZE);
 	}
 	// can not fill the entire buffer, string must be NULL terminated
-	int max_read_size = conn->buffer_size - conn->pos - 1;
+	int max_read_size = JRPC_MAX_RECV_BUFFER_SIZE - conn->pos - 1;
 	result = cy_socket_recv(
 		hanlde, conn->buffer + conn->pos, 
 		max_read_size, CY_SOCKET_FLAGS_NONE, &bytes_read
@@ -179,6 +174,8 @@ static cy_rslt_t destroy_connection(cy_socket_t handle, void *arg) {
 		return cy_socket_disconnect(hanlde, 0);
 	}
 	conn->pos += bytes_read;
+	*(conn->buffer + conn->pos) = '\0';
+	conn->pos++;
 
 	if ((root = cJSON_ParseWithOpts(conn->buffer, &end_ptr, false)) != NULL) {
 		char * str_result = cJSON_Print(root);
@@ -188,13 +185,9 @@ static cy_rslt_t destroy_connection(cy_socket_t handle, void *arg) {
 		if (root->type == cJSON_Object) {
 			eval_request(server, conn, root);
 		}
-		//shift processed request, discarding it
-		memmove(conn->buffer, end_ptr, strlen(end_ptr) + 2);
 
-		conn->pos = strlen(end_ptr);
-		memset(conn->buffer + conn->pos, 0,
-				conn->buffer_size - conn->pos - 1);
-
+		conn->pos = 0;
+		memset(conn->buffer, '\0', JRPC_MAX_RECV_BUFFER_SIZE);
 		cJSON_Delete(root);
 	} else {
 		// did we parse the entire buffer? If so, just wait for more.
@@ -202,7 +195,6 @@ static cy_rslt_t destroy_connection(cy_socket_t handle, void *arg) {
 		if (end_ptr != (conn->buffer + conn->pos)) {
 			JRPC_LOG("INVALID JSON Received:\n---\n%s\n---", conn->buffer);
 			send_error(conn, JRPC_PARSE_ERROR, "Parse error. Invalid JSON was received by the server.", NULL);
-			return cy_socket_disconnect(hanlde, 0);
 		}
 	}
 	
@@ -211,8 +203,7 @@ static cy_rslt_t destroy_connection(cy_socket_t handle, void *arg) {
 
 cy_rslt_t accept_cb(cy_socket_t handle, void *arg) {
 	struct jrpc_server * server = (struct jrpc_server * ) arg;
-	struct jrpc_connection *conn;
-	conn = (struct jrpc_connection *) malloc(sizeof(struct jrpc_connection));
+	struct jrpc_connection *conn = (struct jrpc_connection *) malloc(sizeof(struct jrpc_connection));
 	cy_socket_opt_callback_t disconn_cb = {
 		.callback = destroy_connection,
 		.arg = conn
@@ -235,12 +226,10 @@ cy_rslt_t accept_cb(cy_socket_t handle, void *arg) {
 			(uint8) (conn->peer_addr.ip_address.ip.v4 >> 16),
 			(uint8) (conn->peer_addr.ip_address.ip.v4 >> 24)
 		);
-		
-		conn->server = server;
-		conn->buffer_size = JRPC_MAX_RECV_BUFFER_SIZE;
-		conn->buffer = (char *) malloc(JRPC_MAX_RECV_BUFFER_SIZE);
-		memset(conn->buffer, 0, JRPC_MAX_RECV_BUFFER_SIZE);
 
+		conn->server = server;
+		conn->pos = 0;
+		memset(conn->buffer, '\0', JRPC_MAX_RECV_BUFFER_SIZE);
 		result = cy_socket_setsockopt(
 			conn->socket, CY_SOCKET_SOL_SOCKET,
 			CY_SOCKET_SO_DISCONNECT_CALLBACK,

@@ -6,11 +6,11 @@
 
 /* RPC server related macros. */
 #define JRPC_SERVER_PORT                           (135)
-#define JRPC_SERVER_MAX_PENDING_CONNECTIONS        (3)
+#define JRPC_SERVER_MAX_PENDING_CONNECTIONS        (1)
 #define JRPC_SERVER_RECV_TIMEOUT_MS                (500)
 
 /* Buffer size to store the incoming messages from server, in bytes. */
-#define JRPC_MAX_RECV_BUFFER_SIZE                  (1460) //
+#define JRPC_MAX_RECV_BUFFER_SIZE                  (1461) // +1 null termination
 
 /*
  *
