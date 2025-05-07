@@ -34,13 +34,32 @@ struct jrpc_connection {
 
 void jrpc_rslt_log(cy_rslt_t result);
 
+static cy_rslt_t destroy_connection(cy_socket_t handle, void *arg) {
+	struct jrpc_connection * conn = (struct jrpc_connection *) arg;
+	cy_rslt_t result;
+	result =  cy_socket_delete(handle);
+	if(result == CY_RSLT_SUCCESS)
+	{
+		free(conn);
+	}
+	return result;
+}
+
 static int send_response(struct jrpc_connection * conn, char *response) {
 	cy_rslt_t result;
+	uint32_t bytes_sent;
+
 	JRPC_LOG("JSON response:\n%s", response);
-	result = cy_socket_send(conn->socket, response, strlen(response), CY_SOCKET_FLAGS_MORE, NULL);
+
+	result = cy_socket_send(conn->socket, response, strlen(response), CY_SOCKET_FLAGS_NONE, &bytes_sent);
 	if(result != CY_RSLT_SUCCESS)
+	{
+		if(result == CY_RSLT_MODULE_SECURE_SOCKETS_CLOSED)
+			destroy_connection(conn->socket, conn);
+		jrpc_rslt_log(result);
 		return result;
-	return cy_socket_send(conn->socket, "\n", 1, CY_SOCKET_FLAGS_NONE, NULL);
+	}
+	return result;
 }
 
 static int send_error(struct jrpc_connection * conn, int code, char* message,
@@ -134,18 +153,6 @@ static int eval_request(struct jrpc_server *server,
 	}
 	send_error(conn, JRPC_INVALID_REQUEST, "The JSON sent is not a valid Request object.", NULL);
 	return -1;
-}
-
-static cy_rslt_t destroy_connection(cy_socket_t handle, void *arg) {
-	struct jrpc_connection * conn = (struct jrpc_connection *) arg;
-	cy_rslt_t result;
-	// cy_socket_shutdown(handle, CY_SOCKET_SHUT_RDWR);
-	result =  cy_socket_delete(handle);
-	if(result == CY_RSLT_SUCCESS)
-	{
-		free(conn);
-	}
-	return result;
 }
 
 static cy_rslt_t recieve( cy_socket_t hanlde, void *arg) 
