@@ -32,7 +32,11 @@ struct jrpc_connection {
 	char buffer[JRPC_MAX_RECV_BUFFER_SIZE];
 };
 
+#ifndef NDEBUG
 void jrpc_rslt_log(cy_rslt_t result);
+#else
+inline void jrpc_rslt_log(void *);
+#endif
 
 static cy_rslt_t destroy_connection(cy_socket_t handle, void *arg) {
 	struct jrpc_connection * conn = (struct jrpc_connection *) arg;
@@ -466,6 +470,6 @@ void jrpc_rslt_log(cy_rslt_t result)
     }
 
 }
-#elif
-inline void jrpc_rslt_log(void){}
+#else
+inline void jrpc_rslt_log(void *){}
 #endif
